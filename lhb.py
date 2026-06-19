@@ -5,54 +5,6 @@ import pygismo as gs
 from itertools import product
 
 
-def apply_multiple_refinements(
-    discretization, *refinements: tuple[int, str], check_validity=False
-):
-    p = dyada.PlannedAdaptiveRefinement(discretization)
-    for level, direction in refinements:
-        p.plan_refinement(level, direction)
-    discretization, index_mapping = p.apply_refinements(track_mapping="boxes")
-    if check_validity:
-        dyada.plot_all_boxes_2d(discretization, labels="boxes")
-    return discretization, index_mapping
-
-
-def get_boxes_in_area_naive(discretization, bb_min, bb_max):
-    box_trovati = []
-
-    for box_idx, level_index in enumerate(discretization.get_all_boxes_level_indices()):
-        box_coords = dyada.get_coordinates_from_level_index(level_index)
-        b_min = box_coords.lower_bound
-        b_max = box_coords.upper_bound
-
-        if np.all(b_min < bb_max) and np.all(b_max > bb_min):
-            box_trovati.append(box_idx)
-
-    return box_trovati
-
-
-def active(func_levels, leaf_boxes_in_support):
-    closest_common_ancestor = leaf_boxes_in_support[0].d_level
-    for box in leaf_boxes_in_support:
-        box_levels = box.d_level
-        if np.any(func_levels > box_levels):  # first condition
-            return False
-        closest_common_ancestor = np.minimum(closest_common_ancestor, box_levels)
-    if np.all(closest_common_ancestor <= func_levels):  # second condition
-        return True
-    return False
-
-
-def gen_tbases(num_dimensions, knot_vectors):
-    tbases = {}
-    # può essere ottimizzato utilizzando i generatori, ma va bene così, tanto questa funzione andrà a morire
-    func = getattr(gs.nurbs, f"gsTensorBSplineBasis{num_dimensions}")
-    # può essere ottimizzato utilizzando i generatori, ma va bene così, tanto questa funzione andrà a morire
-    for indexes in product(range(len(knot_vectors)), repeat=num_dimensions):
-        tbases[indexes] = func(*[knot_vectors[i] for i in indexes])
-    return tbases
-
-
 def gen_knot_vectors(max_refinement, degree):
     knot_vectors = []
     for i in range(max_refinement + 1):
@@ -67,6 +19,121 @@ def gen_knot_vectors(max_refinement, degree):
     return knot_vectors
 
 
+def gen_tbases(num_dimensions, knot_vectors):
+    tbases = {}
+    tensorProductGenerator = getattr(gs.nurbs, f"gsTensorBSplineBasis{num_dimensions}")
+    for indexes in product(range(len(knot_vectors)), repeat=num_dimensions):
+        tbases[indexes] = tensorProductGenerator(*[knot_vectors[i] for i in indexes])
+    return tbases
+
+
+def get_active_bases(tensor_bases, leaf_boxes):
+    global_base_id = 0
+    active_functions = {}
+
+    def build_ancestor_tensor(target_level, boxes):
+        grid_shape = tuple(map(pow, [2] * len(target_level), target_level))
+
+        ancestors_tensor = np.empty(grid_shape, dtype=object)
+        ancestors_tensor.fill(tuple([62] * len(target_level)))
+
+        for box in boxes:
+            grid_ranges = []
+            for target_l, box_l, box_idx in zip(target_level, box.d_level, box.d_index):
+                if target_l >= box_l:
+                    diff = target_l - box_l
+                    start = box_idx << diff
+                    end = (box_idx + 1) << diff
+                else:
+                    diff = box_l - target_l
+                    start = box_idx >> diff
+                    end = start + 1
+                grid_ranges.append(range(start, end))
+
+            box_level_tuple = tuple(box.d_level)
+            for coord in product(*grid_ranges):
+                ancestors_tensor[coord] = tuple(
+                    np.minimum(ancestors_tensor[coord], box_level_tuple)
+                )
+
+        return ancestors_tensor
+
+    def check_if_basis_is_active(
+        basis_function_levels,
+        support_min_bounds,
+        support_max_bounds,
+        ancestors_matrix,
+    ):
+        tensor_shape = ancestors_matrix.shape
+        grid_indices_start = [
+            int(np.floor(continuous_min * axis_size))
+            for continuous_min, axis_size in zip(support_min_bounds, tensor_shape)
+        ]
+        grid_indices_end = [
+            int(np.ceil(continuous_max * axis_size))
+            for continuous_max, axis_size in zip(support_max_bounds, tensor_shape)
+        ]
+
+        support_slice = tuple(
+            slice(start, end)
+            for start, end in zip(grid_indices_start, grid_indices_end)
+        )
+        sub_tensor_region = ancestors_matrix[support_slice]
+
+        if sub_tensor_region.size == 0:
+            return False
+
+        closest_common_ancestor_level = list(sub_tensor_region.flat[0])
+
+        for cell_box_level in sub_tensor_region.flat:
+            # first condition
+            if any(
+                func_l > box_l
+                for func_l, box_l in zip(basis_function_levels, cell_box_level)
+            ):
+                return False
+
+            closest_common_ancestor_level = [
+                min(current_min, current_box_l)
+                for current_min, current_box_l in zip(
+                    closest_common_ancestor_level, cell_box_level
+                )
+            ]
+
+        # second condition
+        if all(
+            ancestor_l <= func_l
+            for ancestor_l, func_l in zip(
+                closest_common_ancestor_level, basis_function_levels
+            )
+        ):
+            return True
+
+        return False
+
+    for current_basis_levels, tensor_basis in tensor_bases.items():
+        ancestors_matrix = build_ancestor_tensor(current_basis_levels, leaf_boxes)
+
+        for basis_function_index in range(tensor_basis.size()):
+            support_min_bounds, support_max_bounds = zip(
+                *tensor_basis.support(basis_function_index)
+            )
+
+            if check_if_basis_is_active(
+                current_basis_levels,
+                support_min_bounds,
+                support_max_bounds,
+                ancestors_matrix,
+            ):
+                active_functions[global_base_id] = (
+                    current_basis_levels,
+                    basis_function_index,
+                )
+                global_base_id += 1
+
+    return active_functions
+
+
 if __name__ == "__main__":
     num_dimensions = 2
     initial_mesh = bitarray("100110000100100001100001000000001000010001010000010000")
@@ -79,28 +146,12 @@ if __name__ == "__main__":
 
     print(discretization)
 
-    max_refinement = max(discretization.descriptor.get_maximum_level())
-    boxes_and_bounds = list(discretization.get_all_boxes_level_indices())
+    max_refinement_level = max(discretization.descriptor.get_maximum_level())
+    leaf_boxes = list(discretization.get_all_boxes_level_indices())
 
-    knot_vectors = gen_knot_vectors(max_refinement, degree)
+    knot_vectors = gen_knot_vectors(max_refinement_level, degree)
     tbases = gen_tbases(num_dimensions, knot_vectors)
 
-    global_base_id = 0
-    active_functions = {}
+    active_bases = get_active_bases(tbases, leaf_boxes)
 
-    for indexes, tbasis in tbases.items():
-        for i in range(tbasis.size()):
-            bb_min, bb_max = zip(*tbasis.support(i))
-
-            boxes_in_support_idx = get_boxes_in_area_naive(
-                discretization, bb_min, bb_max
-            )
-            leaf_boxes_in_support = [
-                boxes_and_bounds[idx] for idx in boxes_in_support_idx
-            ]
-
-            if active(indexes, leaf_boxes_in_support):
-                active_functions[global_base_id] = (indexes, i)
-                global_base_id += 1
-
-    print("Active functions:", len(active_functions))
+    print("Active functions:", len(active_bases))
