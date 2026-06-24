@@ -134,17 +134,11 @@ def get_active_bases(tensor_bases, leaf_boxes):
     return active_functions
 
 
-if __name__ == "__main__":
-    num_dimensions = 2
-    initial_mesh = bitarray("100110000100100001100001000000001000010001010000010000")
-    degree = 2
-
+def lhb_constructor(num_dimensions, degree, initial_mesh):
     discretization = dyada.Discretization(
         dyada.MortonOrderLinearization(),
         dyada.RefinementDescriptor.from_binary(num_dimensions, initial_mesh),
     )
-
-    print(discretization)
 
     max_refinement_level = max(discretization.descriptor.get_maximum_level())
     leaf_boxes = list(discretization.get_all_boxes_level_indices())
@@ -153,5 +147,15 @@ if __name__ == "__main__":
     tbases = gen_tbases(num_dimensions, knot_vectors)
 
     active_bases = get_active_bases(tbases, leaf_boxes)
+
+    return active_bases
+
+
+if __name__ == "__main__":
+    num_dimensions = 2
+    initial_mesh = bitarray("100110000100100001100001000000001000010001010000010000")
+    degree = 2
+
+    active_bases = lhb_constructor(num_dimensions, degree, initial_mesh)
 
     print("Active functions:", len(active_bases))
